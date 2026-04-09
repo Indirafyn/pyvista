@@ -205,6 +205,99 @@ def get_ext(filename: str | Path) -> str:
     return ext
 
 
+# Refactoring type: Extract Method — isolate sequence loading logic from `read`.
+def _read_sequence(filename: Sequence[PathStrSeq], file_format: str | None) -> pv.MultiBlock:
+    multi = pv.MultiBlock()
+    for each in filename:
+        name = Path(each).name if isinstance(each, (str, Path)) else None
+        multi.append(read(each, file_format=file_format), name)  # type: ignore[arg-type]
+    return multi
+
+
+# Refactoring type: Extract Method — isolate URI resolution/custom URI reader handling.
+def _resolve_uri_or_file(
+    filename: PathStrSeq,
+) -> DataObject | str | PathStrSeq:
+    # Circular import: reader_registry -> reader -> fileio
+    from pyvista.core.utilities.reader_registry import LocalFileRequiredError  # noqa: PLC0415
+    from pyvista.core.utilities.reader_registry import _download_uri  # noqa: PLC0415
+    from pyvista.core.utilities.reader_registry import _get_ext_handler  # noqa: PLC0415
+    from pyvista.core.utilities.reader_registry import has_scheme  # noqa: PLC0415
+
+    if isinstance(filename, str) and has_scheme(filename):
+        uri_ext = get_ext(urlparse(filename).path)
+        ext_handler = _get_ext_handler(uri_ext)
+        if ext_handler is not None:
+            try:
+                return ext_handler(filename)
+            except LocalFileRequiredError:
+                filename = _download_uri(filename, uri_ext)
+                return ext_handler(filename)
+        return _download_uri(filename, uri_ext)
+    return filename
+
+
+# Refactoring type: Extract Method — isolate extension-based dispatch from `read`.
+def _read_from_extension(
+    filename: Path,
+    ext: str,
+) -> DataObject | None:
+    # Circular import: reader_registry -> reader -> fileio
+    from pyvista.core.utilities.reader_registry import _get_ext_handler  # noqa: PLC0415
+
+    if ext in ['.e', '.exo']:
+        return read_exodus(filename)
+    if ext.lower() == '.grdecl':
+        return read_grdecl(filename)
+    if ext in ['.wrl', '.vrml']:
+        msg = (
+            'VRML files must be imported directly into a Plotter. '
+            'See `pyvista.Plotter.import_vrml` for details.'
+        )
+        raise ValueError(msg)
+    if ext in PICKLE_EXT:
+        return read_pickle(filename)
+
+    ext_handler = _get_ext_handler(ext)
+    if ext_handler is not None:
+        return ext_handler(str(filename))
+    return None
+
+
+# Refactoring type: Extract Method — isolate VTK/meshio fallback and error mapping.
+def _read_with_vtk_or_meshio(
+    filename: Path,
+    force_ext: str | None,
+    progress_bar: bool,  # noqa: FBT001
+) -> DataObject:
+    try:
+        reader = pv.get_reader(filename, force_ext)
+    except ValueError:
+        if force_ext is not None:
+            msg = 'This file was not able to be automatically read by pyvista.'
+            raise OSError(msg)
+        from meshio._exceptions import ReadError  # noqa: PLC0415
+
+        try:
+            return read_meshio(filename)
+        except ReadError:
+            msg = 'This file was not able to be automatically read by pyvista.'
+            raise OSError(msg)
+    else:
+        observer = Observer()
+        observer.observe(reader.reader)
+        if progress_bar:
+            reader.show_progress()
+        mesh = reader.read()
+        if observer.has_event_occurred():
+            warn_external(
+                f'The VTK reader `{reader.reader.GetClassName()}` in pyvista reader `{reader}` '
+                'raised an error while reading the file.\n'
+                f'\t"{observer.get_message()}"',
+            )
+        return mesh
+
+
 @_deprecate_positional_args(allowed=['filename'])
 def read(  # noqa: PLR0911, PLR0917
     filename: PathStrSeq,
@@ -299,33 +392,12 @@ def read(  # noqa: PLR0911, PLR0917
         raise ValueError(msg)
 
     if isinstance(filename, Sequence) and not isinstance(filename, str):
-        multi = pv.MultiBlock()
-        for each in filename:
-            name = Path(each).name if isinstance(each, (str, Path)) else None
-            multi.append(read(each, file_format=file_format), name)  # type: ignore[arg-type]
-        return multi
+        return _read_sequence(filename, file_format)
 
-    # Circular import: reader_registry -> reader -> fileio
-    from pyvista.core.utilities.reader_registry import LocalFileRequiredError  # noqa: PLC0415
-    from pyvista.core.utilities.reader_registry import _download_uri  # noqa: PLC0415
-    from pyvista.core.utilities.reader_registry import _get_ext_handler  # noqa: PLC0415
-    from pyvista.core.utilities.reader_registry import has_scheme  # noqa: PLC0415
-
-    # Handle remote URIs before Path coercion
-    if isinstance(filename, str) and has_scheme(filename):
-        uri_ext = get_ext(urlparse(filename).path)
-        # If a custom reader is registered for this extension, try it
-        # with the raw URI first — the reader may handle cloud paths
-        # natively (e.g. zarr stores on S3). If it fails, fall back to
-        # downloading the file and retrying with a local path.
-        ext_handler = _get_ext_handler(uri_ext)
-        if ext_handler is not None:
-            try:
-                return ext_handler(filename)
-            except LocalFileRequiredError:
-                filename = _download_uri(filename, uri_ext)
-                return ext_handler(filename)
-        filename = _download_uri(filename, uri_ext)
+    resolved = _resolve_uri_or_file(filename)
+    if isinstance(resolved, pv.DataObject):
+        return resolved
+    filename = resolved
 
     filename = Path(filename).expanduser().resolve()
     if not filename.is_file() and not filename.is_dir():
@@ -337,51 +409,11 @@ def read(  # noqa: PLR0911, PLR0917
         return read_meshio(filename, file_format)
 
     ext = _get_ext_force(filename, force_ext)
-    if ext in ['.e', '.exo']:
-        return read_exodus(filename)
-    if ext.lower() == '.grdecl':
-        return read_grdecl(filename)
-    if ext in ['.wrl', '.vrml']:
-        msg = (
-            'VRML files must be imported directly into a Plotter. '
-            'See `pyvista.Plotter.import_vrml` for details.'
-        )
-        raise ValueError(msg)
-    if ext in PICKLE_EXT:
-        return read_pickle(filename)
-
-    # Check for registered custom extension readers
-    ext_handler = _get_ext_handler(ext)
-    if ext_handler is not None:
-        return ext_handler(str(filename))
-
-    try:
-        reader = pv.get_reader(filename, force_ext)
-    except ValueError:
-        # if using force_ext, we are explicitly only using vtk readers
-        if force_ext is not None:
-            msg = 'This file was not able to be automatically read by pyvista.'
-            raise OSError(msg)
-        from meshio._exceptions import ReadError  # noqa: PLC0415
-
-        try:
-            return read_meshio(filename)
-        except ReadError:
-            msg = 'This file was not able to be automatically read by pyvista.'
-            raise OSError(msg)
-    else:
-        observer = Observer()
-        observer.observe(reader.reader)
-        if progress_bar:
-            reader.show_progress()
-        mesh = reader.read()
-        if observer.has_event_occurred():
-            warn_external(
-                f'The VTK reader `{reader.reader.GetClassName()}` in pyvista reader `{reader}` '
-                'raised an error while reading the file.\n'
-                f'\t"{observer.get_message()}"',
-            )
+    mesh = _read_from_extension(filename, ext)
+    if mesh is not None:
         return mesh
+
+    return _read_with_vtk_or_meshio(filename, force_ext, progress_bar)
 
 
 def _apply_attrs_to_reader(
@@ -551,6 +583,156 @@ def read_exodus(  # noqa: PLR0917
     return cast('pv.DataSet', wrap(reader.GetOutput()))
 
 
+# Refactoring type: Extract Class — moved GRDECL parsing responsibilities out of `read_grdecl`.
+class _GRDECLParser:
+    def __init__(
+        self, property_keywords: Sequence[str], other_keywords: Sequence[str]
+    ) -> None:
+        self.property_keywords = tuple(property_keywords)
+        self.other_keywords = tuple(other_keywords)
+        self.keys = self.property_keywords + self.other_keywords
+
+    @overload
+    def read_keyword(
+        self,
+        f: TextIO,
+        split: Literal[True] = True,  # noqa: FBT002
+        converter: type = ...,
+    ) -> list[str]: ...
+
+    @overload
+    def read_keyword(
+        self,
+        f: TextIO,
+        split: Literal[False] = False,  # noqa: FBT002
+        converter: type = ...,
+    ) -> str: ...
+
+    @overload
+    def read_keyword(
+        self,
+        f: TextIO,
+        split: bool = ...,
+        converter: type = ...,
+    ) -> list[str]: ...  # noqa: FBT001
+
+    @_deprecate_positional_args(allowed=['f'])
+    def read_keyword(
+        self,
+        f: TextIO,
+        split: bool = True,  # noqa: FBT001, FBT002
+        converter: type | None = None,
+    ) -> str | list[str]:
+        out: list[str] = []
+        while True:
+            line = f.readline().strip()
+            if line.endswith('/'):
+                line = line[:-1].strip()
+                if line:
+                    end = True
+                else:
+                    break
+            elif line.startswith('--') or not line:
+                continue
+            else:
+                end = False
+
+            if split:
+                line_ = line.split()
+                out += [converter(x) for x in line_] if converter is not None else line_
+            else:
+                out.append(line)
+
+            if end:
+                break
+
+        if not split:
+            return ' '.join(out)
+        return out
+
+    def _handle_mapunits(self, f: TextIO, keywords: dict[str, str | list[Any]]) -> None:
+        keywords['MAPUNITS'] = self.read_keyword(f, split=False).replace("'", '').strip()
+
+    def _handle_mapaxes(self, f: TextIO, keywords: dict[str, str | list[Any]]) -> None:
+        keywords['MAPAXES'] = self.read_keyword(f, converter=float)
+
+    def _handle_gridunit(self, f: TextIO, keywords: dict[str, str | list[Any]]) -> None:
+        keywords['GRIDUNIT'] = self.read_keyword(f, split=False).replace("'", '').strip()
+
+    def _handle_specgrid(self, f: TextIO, keywords: dict[str, str | list[Any]]) -> None:
+        data = self.read_keyword(f)
+        keywords['SPECGRID'] = [
+            int(data[0]),
+            int(data[1]),
+            int(data[2]),
+            int(data[3]),
+            data[4].strip(),
+        ]
+
+    def _handle_include(
+        self, f: TextIO, _keywords: dict[str, str | list[Any]], includes: list[str]
+    ) -> None:
+        filename = self.read_keyword(f, split=False)
+        includes.append(filename.replace("'", ''))
+
+    def _handle_keyword_data(
+        self,
+        f: TextIO,
+        line: str,
+        keywords: dict[str, str | list[Any]],
+    ) -> None:
+        key = line.split()[0]
+        data = self.read_keyword(f)
+        if key in self.property_keywords:
+            keywords[key] = []
+            for x in data:
+                if '*' in x:
+                    size, new_x = x.split('*')
+                    keywords[key] += int(size) * [float(new_x)]  # type: ignore[operator]
+                else:
+                    keywords[key].append(float(x))  # type: ignore[union-attr]
+        else:
+            keywords[key] = data
+
+    def read_buffer(self, f: TextIO) -> tuple[dict[str, Any], Sequence[str]]:
+        keywords: dict[str, str | list[Any]] = {}
+        includes: list[str] = []
+        # Refactoring type: Replace Conditional with Dispatch Table — keyword token to parser handler mapping.
+        dispatch_table = {
+            'MAPUNITS': self._handle_mapunits,
+            'MAPAXES': self._handle_mapaxes,
+            'GRIDUNIT': self._handle_gridunit,
+            'SPECGRID': self._handle_specgrid,
+        }
+
+        for line in f:
+            line_ = line.strip()
+            if not line_:
+                continue
+            token = line_.split()[0]
+            if token == 'INCLUDE':
+                self._handle_include(f, keywords, includes)
+                continue
+            handler = dispatch_table.get(token)
+            if handler is not None:
+                handler(f, keywords)
+            elif token in self.keys:
+                self._handle_keyword_data(f, line, keywords)
+        return keywords, includes
+
+    def read_keywords(self, filename: str | Path) -> dict[str, Any]:
+        with Path.open(Path(filename)) as f:
+            keywords, includes = self.read_buffer(f)
+
+        if includes:
+            path = Path(filename).parent
+            for include in includes:
+                with Path.open(path / include) as f:
+                    keywords_, _ = self.read_buffer(f)
+                keywords.update(keywords_)
+        return keywords
+
+
 @_deprecate_positional_args(allowed=['filename'])
 def read_grdecl(
     filename: str | Path,
@@ -602,184 +784,10 @@ def read_grdecl(
         'ZONES',
     )
 
-    @overload
-    def read_keyword(
-        f: TextIO,
-        split: Literal[True] = True,  # noqa: FBT002
-        converter: type = ...,
-    ) -> list[str]: ...
-    @overload
-    def read_keyword(f: TextIO, split: Literal[False] = False, converter: type = ...) -> str: ...  # noqa: FBT002
-    @overload
-    def read_keyword(f: TextIO, split: bool = ..., converter: type = ...) -> list[str]: ...  # noqa: FBT001
-    @_deprecate_positional_args(allowed=['f'])
-    def read_keyword(
-        f: TextIO,
-        split: bool = True,  # noqa: FBT001, FBT002
-        converter: type | None = None,
-    ) -> str | list[str]:
-        """Read a keyword.
-
-        Parameters
-        ----------
-        f : TextIO
-            File buffer.
-
-        split : bool, default: True
-            If True, split strings.
-
-        converter : callable, optional
-            Function to apply to split strings.
-
-        Returns
-        -------
-        output : list | str
-            A list or a string.
-
-        """
-        out: list[str] = []
-
-        while True:
-            line = f.readline().strip()
-
-            if line.endswith('/'):
-                line = line[:-1].strip()
-
-                if line:
-                    end = True
-
-                else:
-                    break
-
-            elif line.startswith('--') or not line:
-                continue
-
-            else:
-                end = False
-
-            if split:
-                line_ = line.split()
-                out += [converter(x) for x in line_] if converter is not None else line_
-
-            else:
-                out.append(line)
-
-            if end:
-                break
-
-        if not split:
-            return ' '.join(out)
-
-        return out
-
-    def read_buffer(
-        f: TextIO, other_keywords: Sequence[str]
-    ) -> tuple[dict[str, Any], Sequence[str]]:
-        """Read a file buffer.
-
-        Parameters
-        ----------
-        f : TextIO
-            File buffer.
-
-        other_keywords : sequence[str], optional
-            Additional keywords to read that are ignored by default.
-
-        Returns
-        -------
-        dict
-            Dictionary of read keywords.
-
-        sequence[str]
-            Included file names.
-
-        """
-        keys: Sequence[str] = list(property_keywords) + list(other_keywords)
-        keys = tuple(keys)
-
-        keywords: dict[str, str | list[Any]] = {}
-        includes = []
-
-        for line in f:
-            line_ = line.strip()
-
-            if line_.startswith('MAPUNITS'):
-                keywords['MAPUNITS'] = read_keyword(f, split=False).replace("'", '').strip()
-
-            elif line_.startswith('MAPAXES'):
-                keywords['MAPAXES'] = read_keyword(f, converter=float)
-
-            elif line_.startswith('GRIDUNIT'):
-                keywords['GRIDUNIT'] = read_keyword(f, split=False).replace("'", '').strip()
-
-            elif line_.startswith('SPECGRID'):
-                data = read_keyword(f)
-                keywords['SPECGRID'] = [
-                    int(data[0]),
-                    int(data[1]),
-                    int(data[2]),
-                    int(data[3]),
-                    data[4].strip(),
-                ]
-
-            elif line_.startswith('INCLUDE'):
-                filename = read_keyword(f, split=False)
-                includes.append(filename.replace("'", ''))
-
-            elif line_.startswith(keys):
-                key = line.split()[0]
-                data = read_keyword(f)
-
-                if key in property_keywords:
-                    keywords[key] = []
-
-                    for x in data:
-                        if '*' in x:
-                            size, new_x = x.split('*')
-                            keywords[key] += int(size) * [float(new_x)]  # type: ignore[operator]
-
-                        else:
-                            keywords[key].append(float(x))  # type: ignore[union-attr]
-
-                else:
-                    keywords[key] = data
-
-        return keywords, includes
-
-    def read_keywords(filename: str | Path, other_keywords: Sequence[str]) -> dict[str, Any]:
-        """Read a GRDECL file and return its keywords.
-
-        Parameters
-        ----------
-        filename : str | Path
-            The path to the GRDECL file to read.
-
-        other_keywords : sequence[str], optional
-            Additional keywords to read that are ignored by default.
-
-        Returns
-        -------
-        dict
-            Dictionary of read keywords.
-
-        """
-        with Path.open(Path(filename)) as f:
-            keywords, includes = read_buffer(f, other_keywords)
-
-        if includes:
-            path = Path(filename).parent
-
-            for include in includes:
-                with Path.open(path / include) as f:
-                    keywords_, _ = read_buffer(f, other_keywords)
-
-                keywords.update(keywords_)
-
-        return keywords
-
     # Read keywords
     other_keywords = other_keywords or []
-    keywords = read_keywords(filename, other_keywords)
+    parser = _GRDECLParser(property_keywords, other_keywords)
+    keywords = parser.read_keywords(filename)
 
     try:
         ni, nj, nk = keywords['SPECGRID'][:3]
