@@ -207,6 +207,7 @@ def get_ext(filename: str | Path) -> str:
 
 # Refactoring type: Extract Method — isolate sequence loading logic from `read`.
 def _read_sequence(filename: Sequence[PathStrSeq], file_format: str | None) -> pv.MultiBlock:
+    """Read a sequence of files and return them as a MultiBlock."""
     multi = pv.MultiBlock()
     for each in filename:
         name = Path(each).name if isinstance(each, (str, Path)) else None
@@ -217,7 +218,8 @@ def _read_sequence(filename: Sequence[PathStrSeq], file_format: str | None) -> p
 # Refactoring type: Extract Method — isolate URI resolution/custom URI reader handling.
 def _resolve_uri_or_file(
     filename: PathStrSeq,
-) -> DataObject | str | PathStrSeq:
+) -> DataObject | PathStrSeq:
+    """Resolve a URI to a local file or return a dataset handled by a custom URI reader."""
     # Circular import: reader_registry -> reader -> fileio
     from pyvista.core.utilities.reader_registry import LocalFileRequiredError  # noqa: PLC0415
     from pyvista.core.utilities.reader_registry import _download_uri  # noqa: PLC0415
@@ -242,6 +244,7 @@ def _read_from_extension(
     filename: Path,
     ext: str,
 ) -> DataObject | None:
+    """Try extension-based readers and return ``None`` when no extension handler matches."""
     # Circular import: reader_registry -> reader -> fileio
     from pyvista.core.utilities.reader_registry import _get_ext_handler  # noqa: PLC0415
 
@@ -270,6 +273,7 @@ def _read_with_vtk_or_meshio(
     force_ext: str | None,
     progress_bar: bool,  # noqa: FBT001
 ) -> DataObject:
+    """Read with VTK first, then fall back to meshio when automatic VTK reading fails."""
     try:
         reader = pv.get_reader(filename, force_ext)
     except ValueError:

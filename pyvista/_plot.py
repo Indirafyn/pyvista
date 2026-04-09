@@ -40,12 +40,14 @@ class _ShowOptions:
     return_viewer: bool
     return_cpos: bool
     jupyter_kwargs: dict
+    before_close_callback: object | None
 
 
 # Refactoring type: Extract Method — centralized item insertion logic for both list and scalar inputs.
 def _add_plot_item(
     pl: pv.Plotter, item: PlottableType, *, volume: bool, kwargs: dict
 ) -> None:
+    """Add one input item as volume or mesh based on the item type and ``volume`` flag."""
     if volume or (isinstance(item, np.ndarray) and item.ndim == 3):
         pl.add_volume(item, **kwargs)
     else:
@@ -60,6 +62,7 @@ def _add_var_item(
     volume: bool,
     kwargs: dict,
 ) -> None:
+    """Add list/scalar input, with special handling for arrow pairs and MultiBlock inputs."""
     if isinstance(var_item, list):
         if len(var_item) == 2 and all(isinstance(item, np.ndarray) for item in var_item):  # might be arrows
             pl.add_arrows(var_item[0], var_item[1])
@@ -79,6 +82,7 @@ def _add_var_item(
 def _configure_anti_aliasing(
     pl: pv.Plotter, anti_aliasing: Literal['ssaa', 'msaa', 'fxaa'] | bool | None
 ) -> None:
+    """Apply anti-aliasing settings where ``True`` maps to ``'msaa'``."""
     if anti_aliasing:
         if anti_aliasing is True:
             pl.enable_anti_aliasing('msaa', multi_samples=pv.global_theme.multi_samples)
@@ -90,6 +94,7 @@ def _configure_anti_aliasing(
 
 # Refactoring type: Extract Method — isolated background setup and validation.
 def _set_plot_background(pl: pv.Plotter, background: ColorLike | None) -> None:
+    """Set a solid-color background or load a background image from a path."""
     try:
         pl.set_background(background)
     except (ValueError, TypeError):
@@ -112,6 +117,7 @@ def _configure_camera_and_effects(
     ssao: bool,
     zoom: str | float | None,
 ) -> None:
+    """Set camera position and optional rendering effects prior to showing the plot."""
     if cpos is None:
         cpos = pl.get_default_cam_pos()
         pl.camera_position = cpos
@@ -402,6 +408,7 @@ def plot(  # noqa: ANN202, PLR0917
         return_viewer=return_viewer,
         return_cpos=return_cpos,
         jupyter_kwargs=jupyter_kwargs,
+        before_close_callback=before_close_callback,
     )
 
     return pl.show(
@@ -411,7 +418,7 @@ def plot(  # noqa: ANN202, PLR0917
         screenshot=show_options.screenshot,
         return_img=show_options.return_img,
         jupyter_backend=show_options.jupyter_backend,
-        before_close_callback=before_close_callback,
+        before_close_callback=show_options.before_close_callback,
         jupyter_kwargs=show_options.jupyter_kwargs,
         return_viewer=show_options.return_viewer,
         return_cpos=show_options.return_cpos,
