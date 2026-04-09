@@ -10,6 +10,7 @@ decouple the ``core`` and ``plotting`` APIs.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Literal
@@ -25,6 +26,116 @@ if TYPE_CHECKING:
     from pyvista.plotting._typing import ColorLike
     from pyvista.plotting._typing import PlottableType
     from pyvista.plotting.themes import Theme
+
+
+# Refactoring type: Introduce Parameter Object — grouped show() arguments passed from plot().
+@dataclass(frozen=True)
+class _ShowOptions:
+    auto_close: bool | None
+    interactive: bool
+    full_screen: bool | None
+    screenshot: str | bool | None
+    return_img: bool
+    jupyter_backend: JupyterBackendOptions | None
+    return_viewer: bool
+    return_cpos: bool
+    jupyter_kwargs: dict
+    before_close_callback: object | None
+
+
+# Refactoring type: Extract Method — centralized item insertion logic for both list and scalar inputs.
+def _add_plot_item(
+    pl: pv.Plotter, item: PlottableType, *, volume: bool, kwargs: dict
+) -> None:
+    """Add one input item as volume or mesh based on the item type and ``volume`` flag."""
+    if volume or (isinstance(item, np.ndarray) and item.ndim == 3):
+        pl.add_volume(item, **kwargs)
+    else:
+        pl.add_mesh(item, **kwargs)
+
+
+# Refactoring type: Consolidate Duplicate Conditional Fragments — one shared path for mesh/volume decision.
+def _add_var_item(
+    pl: pv.Plotter,
+    var_item: list[PlottableType] | PlottableType,
+    *,
+    volume: bool,
+    kwargs: dict,
+) -> None:
+    """Add list/scalar input, with special handling for arrow pairs and MultiBlock inputs."""
+    if isinstance(var_item, list):
+        if len(var_item) == 2 and all(isinstance(item, np.ndarray) for item in var_item):  # might be arrows
+            pl.add_arrows(var_item[0], var_item[1])
+            return
+        for item in var_item:
+            _add_plot_item(pl, item, volume=volume, kwargs=kwargs)
+        return
+
+    if isinstance(var_item, pv.MultiBlock):
+        pl.add_composite(var_item, **kwargs)
+        return
+
+    _add_plot_item(pl, var_item, volume=volume, kwargs=kwargs)
+
+
+# Refactoring type: Extract Method — isolated anti-aliasing setup.
+def _configure_anti_aliasing(
+    pl: pv.Plotter, anti_aliasing: Literal['ssaa', 'msaa', 'fxaa'] | bool | None
+) -> None:
+    """Apply anti-aliasing settings where ``True`` maps to ``'msaa'``."""
+    if anti_aliasing:
+        if anti_aliasing is True:
+            pl.enable_anti_aliasing('msaa', multi_samples=pv.global_theme.multi_samples)
+        else:
+            pl.enable_anti_aliasing(anti_aliasing)
+    elif anti_aliasing is False:
+        pl.disable_anti_aliasing()
+
+
+# Refactoring type: Extract Method — isolated background setup and validation.
+def _set_plot_background(pl: pv.Plotter, background: ColorLike | None) -> None:
+    """Set a solid-color background or load a background image from a path."""
+    try:
+        pl.set_background(background)
+    except (ValueError, TypeError):
+        if isinstance(background, (str, Path)):
+            path = Path(background)
+            if path.is_file():
+                pl.add_background_image(path)
+        else:
+            msg = f'Background must be color-like or a file path. Got {background} instead.'
+            raise TypeError(msg)
+
+
+# Refactoring type: Extract Method — isolated camera/effects setup.
+def _configure_camera_and_effects(
+    pl: pv.Plotter,
+    *,
+    cpos: CameraPositionOptions | None,
+    eye_dome_lighting: bool,
+    parallel_projection: bool,
+    ssao: bool,
+    zoom: str | float | None,
+) -> None:
+    """Set camera position and optional rendering effects prior to showing the plot."""
+    if cpos is None:
+        cpos = pl.get_default_cam_pos()
+        pl.camera_position = cpos
+        pl.camera_set = False
+    else:
+        pl.camera_position = cpos
+
+    if eye_dome_lighting:
+        pl.enable_eye_dome_lighting()
+
+    if parallel_projection:
+        pl.enable_parallel_projection()
+
+    if ssao:
+        pl.enable_ssao()
+
+    if zoom is not None:
+        pl.camera.zoom(zoom)
 
 
 @_deprecate_positional_args(allowed=['var_item'])
@@ -266,50 +377,9 @@ def plot(  # noqa: ANN202, PLR0917
         else:
             pl.add_axes()
 
-    if anti_aliasing:
-        if anti_aliasing is True:
-            pl.enable_anti_aliasing('msaa', multi_samples=pv.global_theme.multi_samples)
-        else:
-            pl.enable_anti_aliasing(anti_aliasing)
-    elif anti_aliasing is False:
-        pl.disable_anti_aliasing()
-
-    try:
-        pl.set_background(background)
-    except (ValueError, TypeError):
-        if isinstance(background, (str, Path)):
-            path = Path(background)
-            if path.is_file():
-                pl.add_background_image(path)
-        else:
-            msg = f'Background must be color-like or a file path. Got {background} instead.'
-            raise TypeError(msg)
-
-    # Handle var_item input
-    def _handle_list(var_item: list[PlottableType]) -> None:
-        if len(var_item) == 2 and all(
-            isinstance(item, np.ndarray) for item in var_item
-        ):  # might be arrows
-            pl.add_arrows(var_item[0], var_item[1])
-            return
-
-        for item in var_item:
-            if volume or (isinstance(item, np.ndarray) and item.ndim == 3):
-                pl.add_volume(item, **kwargs)
-            else:
-                pl.add_mesh(item, **kwargs)
-
-    if isinstance(var_item, list):
-        _handle_list(var_item=var_item)
-
-    elif volume or (isinstance(var_item, np.ndarray) and var_item.ndim == 3):
-        pl.add_volume(var_item, **kwargs)
-
-    elif isinstance(var_item, pv.MultiBlock):
-        pl.add_composite(var_item, **kwargs)
-
-    else:
-        pl.add_mesh(var_item, **kwargs)
+    _configure_anti_aliasing(pl, anti_aliasing)
+    _set_plot_background(pl, background)
+    _add_var_item(pl, var_item, volume=volume, kwargs=kwargs)
 
     if text:
         pl.add_text(text)
@@ -319,34 +389,37 @@ def plot(  # noqa: ANN202, PLR0917
     elif show_bounds:
         pl.show_bounds()
 
-    if cpos is None:
-        cpos = pl.get_default_cam_pos()
-        pl.camera_position = cpos
-        pl.camera_set = False
-    else:
-        pl.camera_position = cpos
+    _configure_camera_and_effects(
+        pl,
+        cpos=cpos,
+        eye_dome_lighting=eye_dome_lighting,
+        parallel_projection=parallel_projection,
+        ssao=ssao,
+        zoom=zoom,
+    )
 
-    if eye_dome_lighting:
-        pl.enable_eye_dome_lighting()
-
-    if parallel_projection:
-        pl.enable_parallel_projection()
-
-    if ssao:
-        pl.enable_ssao()
-
-    if zoom is not None:
-        pl.camera.zoom(zoom)
-
-    return pl.show(
+    show_options = _ShowOptions(
         auto_close=auto_close,
         interactive=interactive,
         full_screen=full_screen,
         screenshot=screenshot,
         return_img=return_img,
         jupyter_backend=jupyter_backend,
-        before_close_callback=before_close_callback,
-        jupyter_kwargs=jupyter_kwargs,
         return_viewer=return_viewer,
         return_cpos=return_cpos,
+        jupyter_kwargs=jupyter_kwargs,
+        before_close_callback=before_close_callback,
+    )
+
+    return pl.show(
+        auto_close=show_options.auto_close,
+        interactive=show_options.interactive,
+        full_screen=show_options.full_screen,
+        screenshot=show_options.screenshot,
+        return_img=show_options.return_img,
+        jupyter_backend=show_options.jupyter_backend,
+        before_close_callback=show_options.before_close_callback,
+        jupyter_kwargs=show_options.jupyter_kwargs,
+        return_viewer=show_options.return_viewer,
+        return_cpos=show_options.return_cpos,
     )
